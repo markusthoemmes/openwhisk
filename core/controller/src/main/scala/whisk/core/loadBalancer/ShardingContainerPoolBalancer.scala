@@ -205,6 +205,8 @@ class ShardingContainerPoolBalancer(config: WhiskConfig, controllerInstance: Ins
    * Subscribes to active acks (completion messages from the invokers), and
    * registers a handler for received active acks from invokers.
    */
+  private val activeAckTopic = s"completed${controllerInstance.toInt}"
+
   private val maxActiveAcksPerPoll = 128
   private val activeAckPollDuration = 1.second
   private val activeAckConsumer =
@@ -237,6 +239,26 @@ class ShardingContainerPoolBalancer(config: WhiskConfig, controllerInstance: Ins
         logging.error(this, s"failed processing message: $raw with $t")
     }
   }
+
+  /*OwKafkaConsumer
+    .batchedSouce(config.kafkaHosts, activeAckTopic, activeAckTopic, 512)
+    .mapConcat[Queue[String]] { batch =>
+      batch.sliding(32).toList
+    }
+    .mapAsyncUnordered(16)({ batch =>
+      Future {
+        batch.foreach { raw =>
+          CompletionMessage.parse(raw) match {
+            case Success(m: CompletionMessage) =>
+              processCompletion(m.response, m.transid, forced = false, invoker = m.invoker)
+
+            case Failure(t) =>
+              logging.error(this, s"failed processing message: $raw with $t")
+          }
+        }
+      }
+    })
+    .runWith(Sink.ignore)*/
 
   /** 5. Process the active-ack and update the state accordingly */
   private def processCompletion(response: Either[ActivationId, WhiskActivation],

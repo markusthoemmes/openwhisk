@@ -101,7 +101,7 @@ case class WhiskActivation(namespace: EntityPath,
         actionOrNot())
   }
 
-  def resultAsJson = response.result.toJson.asJsObject
+  def resultAsJson = response.result.map(_.toJson.asJsObject).getOrElse(JsObject.empty)
 
   def toExtendedJson = {
     val JsObject(baseFields) = WhiskActivation.serdes.write(this).asJsObject

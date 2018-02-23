@@ -42,12 +42,9 @@ import whisk.core.containerpool.ContainerFactoryProvider
 import whisk.core.containerpool.ContainerPool
 import whisk.core.containerpool.ContainerProxy
 import whisk.core.containerpool.PrewarmingConfig
-import whisk.core.containerpool.Run
 import whisk.core.containerpool.logging.LogStoreProvider
-import whisk.core.database._
 import whisk.core.entity._
 import whisk.core.entity.size._
-import whisk.http.Messages
 import whisk.spi.SpiLoader
 import akka.event.Logging.InfoLevel
 
@@ -160,7 +157,7 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
   /** Is called when an ActivationMessage is read from Kafka */
   def processActivationMessage(bytes: Array[Byte]): Future[Unit] = {
     Future(ActivationMessage.parse(new String(bytes, StandardCharsets.UTF_8)))
-      .flatMap(Future.fromTry(_))
+      .flatMap(Future.fromTry)
       .filter(_.action.version.isDefined)
       .flatMap { msg =>
         implicit val transid = msg.transid
@@ -180,55 +177,28 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
           logging.warn(this, s"revision was not provided for ${actionid.id}")
         }
 
-        WhiskAction
-          .get(entityStore, actionid.id, actionid.rev, fromCache = actionid.rev != DocRevision.empty)
-          .flatMap { action =>
-            action.toExecutableWhiskAction match {
-              case Some(executable) =>
-                pool ! Run(executable, msg)
-                Future.successful(())
-              case None =>
-                logging.error(this, s"non-executable action reached the invoker ${action.fullyQualifiedName(false)}")
-                Future.failed(new IllegalStateException("non-executable action reached the invoker"))
-            }
-          }
-          .recoverWith {
-            case t =>
-              // If the action cannot be found, the user has concurrently deleted it,
-              // making this an application error. All other errors are considered system
-              // errors and should cause the invoker to be considered unhealthy.
-              val response = t match {
-                case _: NoDocumentException =>
-                  ActivationResponse.applicationError(Messages.actionRemovedWhileInvoking)
-                case _: DocumentTypeMismatchException | _: DocumentUnreadable =>
-                  ActivationResponse.whiskError(Messages.actionMismatchWhileInvoking)
-                case _ =>
-                  ActivationResponse.whiskError(Messages.actionFetchErrorWhileInvoking)
-              }
-              val now = Instant.now
-              val causedBy = if (msg.causedBySequence) {
-                Some(Parameters(WhiskActivation.causedByAnnotation, JsString(Exec.SEQUENCE)))
-              } else None
-              val activation = WhiskActivation(
-                activationId = msg.activationId,
-                namespace = msg.user.namespace.toPath,
-                subject = msg.user.subject,
-                cause = msg.cause,
-                name = msg.action.name,
-                version = msg.action.version.getOrElse(SemVer()),
-                start = now,
-                end = now,
-                duration = Some(0),
-                response = response,
-                annotations = {
-                  Parameters(WhiskActivation.pathAnnotation, JsString(msg.action.asString)) ++ causedBy
-                })
+        val now = Instant.now
+        val causedBy = if (msg.causedBySequence) {
+          Some(Parameters(WhiskActivation.causedByAnnotation, JsString(Exec.SEQUENCE)))
+        } else None
+        val activation = WhiskActivation(
+          activationId = msg.activationId,
+          namespace = msg.user.namespace.toPath,
+          subject = msg.user.subject,
+          cause = msg.cause,
+          name = msg.action.name,
+          version = msg.action.version.getOrElse(SemVer()),
+          start = now,
+          end = now,
+          duration = Some(0),
+          response = ActivationResponse.success(None),
+          annotations = {
+            Parameters(WhiskActivation.pathAnnotation, JsString(msg.action.asString)) ++ causedBy
+          })
 
-              activationFeed ! MessageFeed.Processed
-              ack(msg.transid, activation, msg.blocking, msg.rootControllerIndex)
-              store(msg.transid, activation)
-              Future.successful(())
-          }
+        activationFeed ! MessageFeed.Processed
+        ack(msg.transid, activation, msg.blocking, msg.rootControllerIndex)
+        Future.successful(())
       }
       .recoverWith {
         case t =>
