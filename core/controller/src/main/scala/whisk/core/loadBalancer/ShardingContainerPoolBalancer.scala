@@ -17,7 +17,7 @@
 
 package whisk.core.loadBalancer
 
-import java.nio.charset.StandardCharsets
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.LongAdder
 import java.util.concurrent.ThreadLocalRandom
 
@@ -26,6 +26,7 @@ import akka.cluster.ClusterEvent._
 import akka.cluster.{Cluster, Member, MemberStatus}
 import akka.event.Logging.InfoLevel
 import akka.stream.ActorMaterializer
+import jawn.support.spray.Parser
 import org.apache.kafka.clients.producer.RecordMetadata
 import pureconfig._
 import whisk.common._
@@ -37,6 +38,7 @@ import whisk.spi.SpiLoader
 
 import scala.annotation.tailrec
 import scala.collection.concurrent.TrieMap
+import scala.collection.immutable.Queue
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
@@ -206,18 +208,35 @@ class ShardingContainerPoolBalancer(config: WhiskConfig, controllerInstance: Ins
    * registers a handler for received active acks from invokers.
    */
   private val activeAckTopic = s"completed${controllerInstance.toInt}"
-
   private val maxActiveAcksPerPoll = 128
   private val activeAckPollDuration = 1.second
   private val activeAckConsumer =
-    messagingProvider.getConsumer(
-      config,
-      "completions",
-      s"completed${controllerInstance.toInt}",
-      maxPeek = maxActiveAcksPerPoll)
+    messagingProvider.getConsumer(config, activeAckTopic, activeAckTopic, maxPeek = maxActiveAcksPerPoll)
+
+  /*new Thread(new Runnable {
+    @tailrec
+    private final def poll(): Unit = {
+      val records = activeAckConsumer.peek(activeAckPollDuration)
+      activeAckConsumer.commit()
+      records.sliding(32).foreach { batch =>
+        Future {
+          batch.foreach {
+            case (_, _, _, bytes) =>
+              Parser.parseFromByteBuffer(ByteBuffer.wrap(bytes)).foreach { value =>
+                val m = CompletionMessage.serdes.read(value)
+                processCompletion(m.response, m.transid, forced = false, invoker = m.invoker)
+              }
+          }
+        }
+      }
+      poll()
+    }
+
+    override def run(): Unit = poll()
+  }).start()*/
 
   private val activationFeed = actorSystem.actorOf(Props {
-    new MessageFeed(
+    new BatchingMessageFeed(
       "activeack",
       logging,
       activeAckConsumer,
@@ -227,18 +246,18 @@ class ShardingContainerPoolBalancer(config: WhiskConfig, controllerInstance: Ins
   })
 
   /** 4. Get the active-ack message and parse it */
-  private def processActiveAck(bytes: Array[Byte]): Future[Unit] = Future {
-    val raw = new String(bytes, StandardCharsets.UTF_8)
-    CompletionMessage.parse(raw) match {
-      case Success(m: CompletionMessage) =>
-        processCompletion(m.response, m.transid, forced = false, invoker = m.invoker)
-        activationFeed ! MessageFeed.Processed
-
-      case Failure(t) =>
-        activationFeed ! MessageFeed.Processed
-        logging.error(this, s"failed processing message: $raw with $t")
+  private def processActiveAck(batch: Queue[Array[Byte]]): Unit =
+    batch.sliding(32).foreach { subbatch =>
+      Future {
+        subbatch.foreach { bytes =>
+          Parser.parseFromByteBuffer(ByteBuffer.wrap(bytes)).foreach { raw =>
+            val m = CompletionMessage.serdes.read(raw)
+            processCompletion(m.response, m.transid, forced = false, invoker = m.invoker)
+            activationFeed ! MessageFeed.Processed
+          }
+        }
+      }
     }
-  }
 
   /*OwKafkaConsumer
     .batchedSouce(config.kafkaHosts, activeAckTopic, activeAckTopic, 512)
