@@ -93,6 +93,7 @@ case object RescheduleJob // job is sent back to parent and could not be process
 class ContainerProxy(
   factory: (TransactionId, String, ImageName, Boolean, ByteSize) => Future[Container],
   sendActiveAck: (TransactionId, WhiskActivation, Boolean, InstanceId) => Future[Any],
+  sendSecondaryActiveAck: (TransactionId, ActivationId, InstanceId) => Future[Any],
   storeActivation: (TransactionId, WhiskActivation) => Future[Any],
   collectLogs: (TransactionId, Identity, WhiskActivation, Container, ExecutableWhiskAction) => Future[ActivationLogs],
   instance: InstanceId,
@@ -374,7 +375,11 @@ class ContainerProxy(
       }
 
     // Sending active ack. Entirely asynchronous and not waited upon.
-    activation.foreach(sendActiveAck(tid, _, job.msg.blocking, job.msg.rootControllerIndex))
+    // This is only sent for blocking invocations, as there latency matters to get the result to the user as quickly
+    // as possible.
+    if (job.msg.blocking) {
+      activation.foreach(sendActiveAck(tid, _, job.msg.blocking, job.msg.rootControllerIndex))
+    }
 
     // Adds logs to the raw activation.
     val activationWithLogs: Future[Either[ActivationLogReadingError, WhiskActivation]] = activation
@@ -394,8 +399,19 @@ class ContainerProxy(
           }
       }
 
-    // Storing the record. Entirely asynchronous and not waited upon.
+    // Storing the record after logs are collected. Entirely asynchronous and not waited upon.
     activationWithLogs.map(_.fold(_.activation, identity)).foreach(storeActivation(tid, _))
+
+    // Send secondary active ack after logs are collected. Entirely asynchronous and not waited upon.
+    // The secondary active ack is only sent if the invocation was blocking. Results are already sent in that case so
+    // only a small ack message is needed. For non-blocking the whole activation is sent back.
+    if (job.msg.blocking) {
+      activationWithLogs.foreach(_ => sendSecondaryActiveAck(tid, job.msg.activationId, job.msg.rootControllerIndex))
+    } else {
+      activationWithLogs
+        .flatMap(_ => activation)
+        .foreach(sendActiveAck(tid, _, job.msg.blocking, job.msg.rootControllerIndex))
+    }
 
     // Disambiguate activation errors and transform the Either into a failed/successful Future respectively.
     activationWithLogs.flatMap {
@@ -410,12 +426,13 @@ object ContainerProxy {
   def props(
     factory: (TransactionId, String, ImageName, Boolean, ByteSize) => Future[Container],
     ack: (TransactionId, WhiskActivation, Boolean, InstanceId) => Future[Any],
+    secondaryAck: (TransactionId, ActivationId, InstanceId) => Future[Any],
     store: (TransactionId, WhiskActivation) => Future[Any],
     collectLogs: (TransactionId, Identity, WhiskActivation, Container, ExecutableWhiskAction) => Future[ActivationLogs],
     instance: InstanceId,
     unusedTimeout: FiniteDuration = 10.minutes,
     pauseGrace: FiniteDuration = 50.milliseconds) =
-    Props(new ContainerProxy(factory, ack, store, collectLogs, instance, unusedTimeout, pauseGrace))
+    Props(new ContainerProxy(factory, ack, secondaryAck, store, collectLogs, instance, unusedTimeout, pauseGrace))
 
   // Needs to be thread-safe as it's used by multiple proxies concurrently.
   private val containerCount = new Counter

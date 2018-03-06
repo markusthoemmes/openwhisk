@@ -18,7 +18,6 @@
 package whisk.core.connector
 
 import scala.util.Try
-
 import spray.json._
 import whisk.common.TransactionId
 import whisk.core.entity.ActivationId
@@ -112,6 +111,15 @@ object CompletionMessage extends DefaultJsonProtocol {
 
   def parse(msg: String): Try[CompletionMessage] = Try(serdes.read(msg.parseJson))
   private val serdes = jsonFormat3(CompletionMessage.apply)
+}
+
+case class SecondaryAckMessage(override val transid: TransactionId, id: ActivationId) extends Message {
+  def serialize = id.asString
+}
+
+object SecondaryAckMessage {
+  def parse(msg: String): Try[SecondaryAckMessage] =
+    ActivationId.parse(msg).map(aid => SecondaryAckMessage(TransactionId.unknown, aid))
 }
 
 case class PingMessage(instance: InstanceId) extends Message {

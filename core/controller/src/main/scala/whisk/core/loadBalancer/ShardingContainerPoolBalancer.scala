@@ -39,7 +39,7 @@ import scala.annotation.tailrec
 import scala.collection.concurrent.TrieMap
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.{Failure, Success}
+import scala.util.{Failure, Success, Try}
 
 /**
  * A loadbalancer that uses "horizontal" sharding to not collide with fellow loadbalancers.
@@ -166,6 +166,7 @@ class ShardingContainerPoolBalancer(config: WhiskConfig, controllerInstance: Ins
         ActivationEntry(
           msg.activationId,
           msg.user.uuid,
+          msg.blocking,
           instance,
           timeoutHandler,
           Promise[Either[ActivationId, WhiskActivation]]())
@@ -224,15 +225,27 @@ class ShardingContainerPoolBalancer(config: WhiskConfig, controllerInstance: Ins
   /** 4. Get the active-ack message and parse it */
   private def processActiveAck(bytes: Array[Byte]): Future[Unit] = Future {
     val raw = new String(bytes, StandardCharsets.UTF_8)
-    CompletionMessage.parse(raw) match {
-      case Success(m: CompletionMessage) =>
-        processCompletion(m.response, m.transid, forced = false, invoker = m.invoker)
-        activationFeed ! MessageFeed.Processed
 
-      case Failure(t) =>
-        activationFeed ! MessageFeed.Processed
-        logging.error(this, s"failed processing message: $raw with $t")
-    }
+    raw.headOption
+    // transform the Option to a Try
+      .fold[Try[Char]](Failure(new IllegalArgumentException("cannot parse an empty string")))(Success.apply)
+      .flatMap { first =>
+        // Iff the first char is {, we know we have a JsObject at hand.
+        if (first == '{') {
+          CompletionMessage
+            .parse(raw)
+            .map(m => processCompletion(m.response, m.transid, forced = false, invoker = m.invoker))
+        } else {
+          SecondaryAckMessage
+            .parse(raw)
+            .map(m => freeResources(m.id))
+        }
+      }
+      .recover {
+        case t => logging.error(this, s"failed processing message: $raw with $t")
+      }
+
+    activationFeed ! MessageFeed.Processed
   }
 
   /** 5. Process the active-ack and update the state accordingly */
@@ -245,7 +258,7 @@ class ShardingContainerPoolBalancer(config: WhiskConfig, controllerInstance: Ins
     // treat left as success (as it is the result of a message exceeding the bus limit)
     val isSuccess = response.fold(l => true, r => !r.response.isWhiskError)
 
-    activations.remove(aid) match {
+    activations.get(aid) match {
       case Some(entry) =>
         if (!forced) {
           entry.timeoutHandler.cancel()
@@ -254,9 +267,15 @@ class ShardingContainerPoolBalancer(config: WhiskConfig, controllerInstance: Ins
           entry.promise.tryFailure(new Throwable("no active ack received"))
         }
 
-        totalActivations.decrement()
-        activationsPerNamespace.get(entry.namespaceId).foreach(_.decrement())
-        schedulingState.invokerSlots.lift(invoker.toInt).foreach(_.release())
+        // Iff this was a non-blocking request, there won't be a secondary active-ack.
+        // Iff active-ack was forced, we assume the secondary active-ack won't come either so we clean up now.
+        if (!entry.blocking || forced) freeResources(aid)
+
+        // First and secondary active-ack might be racy since we always fetch a whole batch from kafka and parallelize
+        if (entry.references.decrementAndGet() == 0) {
+          logging.debug(this, s"entry for $aid removed")
+          activations.remove(aid)
+        }
 
         logging.info(this, s"${if (!forced) "received" else "forced"} active ack for '$aid'")(tid)
         // Active acks that are received here are strictly from user actions - health actions are not part of
@@ -272,6 +291,22 @@ class ShardingContainerPoolBalancer(config: WhiskConfig, controllerInstance: Ins
         // the entry has already been removed by an active ack. This part of the code is reached by the timeout.
         // As the active ack is already processed we don't have to do anything here.
         logging.debug(this, s"forced active ack for '$aid' which has no entry")(tid)
+    }
+  }
+
+  /** 6. Free resources after the invoker is done processing the activation fully */
+  private def freeResources(aid: ActivationId): Unit = {
+    logging.info(this, s"received secondary ack for $aid")
+    activations.get(aid).foreach { entry =>
+      // Update state
+      totalActivations.decrement()
+      activationsPerNamespace.get(entry.namespaceId).foreach(_.decrement())
+      schedulingState.invokerSlots.lift(entry.invokerName.toInt).foreach(_.release())
+
+      if (entry.references.decrementAndGet() == 0) {
+        logging.debug(this, s"entry for $aid removed")
+        activations.remove(aid)
+      }
     }
   }
 

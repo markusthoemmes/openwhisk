@@ -17,17 +17,21 @@
 
 package whisk.core.loadBalancer
 
-import whisk.core.entity.{ActivationId, InstanceId, UUID, WhiskActivation}
+import java.util.concurrent.atomic.AtomicInteger
 
+import whisk.core.entity.{ActivationId, InstanceId, UUID, WhiskActivation}
 import akka.actor.Cancellable
+
 import scala.concurrent.{Future, Promise}
 
 // please note: timeoutHandler.cancel must be called on all non-timeout paths, e.g. Success
 case class ActivationEntry(id: ActivationId,
                            namespaceId: UUID,
+                           blocking: Boolean,
                            invokerName: InstanceId,
                            timeoutHandler: Cancellable,
-                           promise: Promise[Either[ActivationId, WhiskActivation]])
+                           promise: Promise[Either[ActivationId, WhiskActivation]],
+                           references: AtomicInteger = new AtomicInteger(2))
 trait LoadBalancerData {
 
   /** Get the number of activations across all namespaces. */

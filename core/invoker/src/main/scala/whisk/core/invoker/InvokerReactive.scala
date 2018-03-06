@@ -20,16 +20,26 @@ package whisk.core.invoker
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 
-import akka.actor.{ActorRefFactory, ActorSystem, Props}
 import akka.event.Logging.InfoLevel
+import akka.actor.ActorRefFactory
+import akka.actor.ActorSystem
+import akka.actor.Props
 import akka.stream.ActorMaterializer
 import org.apache.kafka.common.errors.RecordTooLargeException
 import pureconfig._
 import spray.json._
-import whisk.common.{Logging, LoggingMarkers, Scheduler, TransactionId}
-import whisk.core.{ConfigKeys, WhiskConfig}
+import whisk.common.Scheduler
+import whisk.core.ConfigKeys
+import whisk.common.Logging
+import whisk.common.LoggingMarkers
+import whisk.common.TransactionId
+import whisk.core.WhiskConfig
 import whisk.core.connector._
-import whisk.core.containerpool._
+import whisk.core.containerpool.ContainerFactoryProvider
+import whisk.core.containerpool.ContainerPool
+import whisk.core.containerpool.ContainerProxy
+import whisk.core.containerpool.PrewarmingConfig
+import whisk.core.containerpool.Run
 import whisk.core.containerpool.logging.LogStoreProvider
 import whisk.core.database._
 import whisk.core.entity._
@@ -128,6 +138,13 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
     }
   }
 
+  private val secondaryAck = (tid: TransactionId, id: ActivationId, controllerInstance: InstanceId) => {
+    producer.send(s"completed${controllerInstance.toInt}", SecondaryAckMessage(tid, id)).andThen {
+      case Success(_) =>
+        logging.info(this, s"posted secondary ack of activation $id")
+    }
+  }
+
   /** Stores an activation in the database. */
   private val store = (tid: TransactionId, activation: WhiskActivation) => {
     implicit val transid: TransactionId = tid
@@ -140,7 +157,9 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
 
   /** Creates a ContainerProxy Actor when being called. */
   private val childFactory = (f: ActorRefFactory) =>
-    f.actorOf(ContainerProxy.props(containerFactory.createContainer, ack, store, logsProvider.collectLogs, instance))
+    f.actorOf(
+      ContainerProxy
+        .props(containerFactory.createContainer, ack, secondaryAck, store, logsProvider.collectLogs, instance))
 
   private val prewarmKind = "nodejs:6"
   private val prewarmExec = ExecManifest.runtimesManifest

@@ -161,6 +161,7 @@ class ContainerPoolBalancer(config: WhiskConfig, controllerInstance: InstanceId)
         ActivationEntry(
           activationId,
           namespaceId,
+          false,
           invokerName,
           timeoutHandler,
           Promise[Either[ActivationId, WhiskActivation]]())
