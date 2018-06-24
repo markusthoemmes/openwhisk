@@ -18,7 +18,7 @@
 package whisk.core.loadBalancer
 
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.ThreadLocalRandom
+import java.util.concurrent.{ConcurrentLinkedDeque, ThreadLocalRandom}
 import java.util.concurrent.atomic.LongAdder
 
 import akka.actor.{Actor, ActorSystem, Cancellable, Props}
@@ -138,10 +138,20 @@ class ShardingContainerPoolBalancer(config: WhiskConfig, controllerInstance: Ins
       if (!action.exec.pull) (schedulingState.managedInvokers, schedulingState.managedStepSizes)
       else (schedulingState.blackboxInvokers, schedulingState.blackboxStepSizes)
     val chosen = if (invokersToUse.nonEmpty) {
-      val hash = ShardingContainerPoolBalancer.generateHash(msg.user.namespace.name, action.fullyQualifiedName(false))
-      val homeInvoker = hash % invokersToUse.size
-      val stepSize = stepSizes(hash % stepSizes.size)
-      ShardingContainerPoolBalancer.schedule(invokersToUse, schedulingState.invokerSlots, homeInvoker, stepSize)
+      val pastDecisions = schedulingState.pastDecisions.get(action.fullyQualifiedName(true))
+
+      pastDecisions
+        .flatMap { decisions =>
+          ShardingContainerPoolBalancer
+            .schedulePreferred(invokersToUse, schedulingState.invokerSlots, decisions)
+        }
+        .orElse {
+          val hash =
+            ShardingContainerPoolBalancer.generateHash(msg.user.namespace.name, action.fullyQualifiedName(false))
+          val homeInvoker = hash % invokersToUse.size
+          val stepSize = stepSizes(hash % stepSizes.size)
+          ShardingContainerPoolBalancer.schedule(invokersToUse, schedulingState.invokerSlots, homeInvoker, stepSize)
+        }
     } else {
       None
     }
@@ -179,6 +189,7 @@ class ShardingContainerPoolBalancer(config: WhiskConfig, controllerInstance: Ins
         ActivationEntry(
           msg.activationId,
           msg.user.namespace.uuid,
+          action.fullyQualifiedName(true),
           instance,
           timeoutHandler,
           Promise[Either[ActivationId, WhiskActivation]]())
@@ -263,6 +274,10 @@ class ShardingContainerPoolBalancer(config: WhiskConfig, controllerInstance: Ins
         totalActivations.decrement()
         activationsPerNamespace.get(entry.namespaceId).foreach(_.decrement())
         schedulingState.invokerSlots.lift(invoker.toInt).foreach(_.release())
+        // TODO: timeout the entries
+        schedulingState.pastDecisions
+          .getOrElseUpdate(entry.actionName, new ConcurrentLinkedDeque[InstanceId]())
+          .offerFirst(invoker)
 
         if (!forced) {
           entry.timeoutHandler.cancel()
@@ -325,6 +340,35 @@ object ShardingContainerPoolBalancer extends LoadBalancerProvider {
         primes :+ cur
       } else primes
     })
+
+  /**
+   * Schedules a request based on scheduling decisions made in the past.
+   *
+   * @param invokers a list of available invokers to search in, including their state
+   * @param dispatched semaphores for each invoker to give the slots away from
+   * @param pastDecisions decisions made in the past in LIFO order
+   * @return
+   */
+  @tailrec
+  def schedulePreferred(invokers: IndexedSeq[InvokerHealth],
+                        dispatched: IndexedSeq[ForcableSemaphore],
+                        pastDecisions: ConcurrentLinkedDeque[InstanceId]): Option[InstanceId] = {
+    // This also removes the element from the past decisions. If the following check for capacity and healthiness is not
+    // true, this past decision can be thrown away anyway, because it doesn't reflect the state of the system anymore
+    // and can be considered stale.
+    val first = pastDecisions.pollFirst()
+    // Explicit null-check to be able to make a tail-recursive call
+    if (first != null) {
+      val invoker = invokers(first.toInt)
+      if (invoker.status == Healthy && dispatched(invoker.id.toInt).tryAcquire()) {
+        Some(invoker.id)
+      } else {
+        schedulePreferred(invokers, dispatched, pastDecisions)
+      }
+    } else {
+      None
+    }
+  }
 
   /**
    * Scans through all invokers and searches for an invoker tries to get a free slot on an invoker. If no slot can be
@@ -390,7 +434,8 @@ case class ShardingContainerPoolBalancerState(
   private var _managedStepSizes: Seq[Int] = ShardingContainerPoolBalancer.pairwiseCoprimeNumbersUntil(0),
   private var _blackboxStepSizes: Seq[Int] = ShardingContainerPoolBalancer.pairwiseCoprimeNumbersUntil(0),
   private var _invokerSlots: IndexedSeq[ForcableSemaphore] = IndexedSeq.empty[ForcableSemaphore],
-  private var _clusterSize: Int = 1)(
+  private var _clusterSize: Int = 1,
+  pastDecisions: TrieMap[FullyQualifiedEntityName, ConcurrentLinkedDeque[InstanceId]] = TrieMap.empty)(
   lbConfig: ShardingContainerPoolBalancerConfig =
     loadConfigOrThrow[ShardingContainerPoolBalancerConfig](ConfigKeys.loadbalancer))(implicit logging: Logging) {
 
@@ -501,6 +546,7 @@ case class ShardingContainerPoolBalancerConfig(blackboxFraction: Double, invoker
  */
 case class ActivationEntry(id: ActivationId,
                            namespaceId: UUID,
+                           actionName: FullyQualifiedEntityName,
                            invokerName: InstanceId,
                            timeoutHandler: Cancellable,
                            promise: Promise[Either[ActivationId, WhiskActivation]])
